@@ -49,8 +49,7 @@ On 283 multi-cancer notes: +41.0 pp on T3, +54.5 pp on T4.
 ```
 pipeline/           Four-phase pipeline (datagen → analysis → benchmark → finetune)
 preprocessing/      MTSamples extraction and real-world TSTR setup
-experiments/        Ablations: Gate vs No-Gate · Gate Decomposition · RAG vs No-RAG
-                    Prompt engineering · Model comparison · Longitudinal generation
+experiments/        Prompt engineering · Model comparison · Longitudinal generation
 utils/              BioPortal SNOMED CT annotation
 data/               Ablation design CSVs (128-cell full factorial · 11-point OFAT)
 ```
