@@ -66,7 +66,5 @@ data/               Ablation design CSVs (128-cell full factorial · 11-point OF
 - Multi-institutional evaluation — MIMIC-III and eICU to test whether synthetic-to-real transfer holds at scale
 
 ---
-
-*Laxmigayathri Challa · PhD, Information Science (Data Science) · University of North Texas*  
 *Paper: IEEE BIBM 2026*  
 *All generated data is synthetic and not intended for clinical use, YET.*
