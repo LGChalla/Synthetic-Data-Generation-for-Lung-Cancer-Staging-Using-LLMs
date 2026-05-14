@@ -1,4 +1,4 @@
-# Synthetic Data for Lung Cancer Staging
+# StageCraft: Neuro-Symbolic Synthetic Clinical Data Generation for Lung Cancer TNM Staging
 
 *What happens when the data you need to build a clinical AI system is exactly the data you can't have?*
 
