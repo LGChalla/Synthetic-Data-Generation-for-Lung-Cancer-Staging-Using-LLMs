@@ -1,19 +1,3 @@
-# Phase4_fixed.py
-# DATAGEN Phase 4 — QLoRA Fine-Tuning
-#
-# ── CHANGELOG ─────────────────────────────────────────────────────────────────
-# FIX 1 [CRITICAL] Pre-training label diversity check:
-#   Original silently trained on whatever CSV was handed to it. If the training
-#   CSV is label-uniform (e.g. all T2/N0/M0), the adapter will learn a degenerate
-#   prior. Now check_label_diversity() runs BEFORE training and raises a clear
-#   warning (with option to abort) if any TNM dimension is single-class.
-#
-# FIX 2 [MINOR] Training set stats logged at startup:
-#   Prints label distribution so the researcher can see diversity at a glance
-#   without re-running Phase 2.
-#
-# All other logic (QLoRA config, optimizer, adapter saving) is unchanged.
-# ──────────────────────────────────────────────────────────────────────────────
 
 import os
 import json
@@ -40,7 +24,91 @@ MODEL_ID = "meta-llama/Meta-Llama-3-8B-Instruct"
 
 # Minimum entropy thresholds (same as Phase 1 and 2)
 DIVERSITY_ENTROPY_FLOOR = {"T": 1.11, "N": 1.11, "M": 0.55}
+import random
 
+
+def _make_derangement(n: int, seed: int = 42) -> list:
+    """
+    Returns a permutation of range(n) with NO fixed point (a derangement):
+    no index maps to itself. Used to scramble (T,N,M) label triples across
+    records while preserving the exact label multiset — so Shannon entropy
+    per dimension is identical to the unscrambled corpus.
+    """
+    rng = random.Random(seed)
+    while True:
+        perm = list(range(n))
+        rng.shuffle(perm)
+        if all(perm[i] != i for i in range(n)):
+            return perm
+
+
+def prepare_scrambled_dataset(csv_path, tokenizer, seed: int = 42):
+    """
+    Adapter A' corpus: same schema-valid, diversity-certified records as
+    Adapter B (Tier 3 Golden), but with (T, N, M) label triples permuted
+    across records under a fixed-seed derangement. Content is unchanged;
+    only note-to-label correspondence is destroyed. Entropy is preserved
+    exactly, isolating correspondence as the single manipulated variable.
+    """
+    if not os.path.exists(csv_path):
+        print(f"Skipping scrambled dataset: {csv_path} not found.")
+        return None
+
+    df = pd.read_csv(csv_path).reset_index(drop=True)
+    n = len(df)
+    perm = _make_derangement(n, seed=seed)
+
+    df_scrambled = df.copy()
+    df_scrambled["T_target"] = df["T_target"].iloc[perm].values
+    df_scrambled["N_target"] = df["N_target"].iloc[perm].values
+    df_scrambled["M_target"] = df["M_target"].iloc[perm].values
+
+    # Verify it is a true derangement (no record keeps its own triple)
+    retained = sum(
+        df_scrambled["T_target"].iloc[i] == df["T_target"].iloc[i] and
+        df_scrambled["N_target"].iloc[i] == df["N_target"].iloc[i] and
+        df_scrambled["M_target"].iloc[i] == df["M_target"].iloc[i]
+        for i in range(n)
+    )
+    print(f"\nAdapter A' scramble (seed={seed}): {retained} of {n} records "
+          f"retain their own triple "
+          f"({'✓ true derangement' if retained == 0 else 'NOT a derangement'})")
+
+    # Confirm entropy is preserved (identical multiset)
+    print("  Entropy check (original vs scrambled):")
+    for col in ("T_target", "N_target", "M_target"):
+        orig = shannon_entropy(df[col].value_counts())
+        scr  = shannon_entropy(df_scrambled[col].value_counts())
+        print(f"    [{col}] original={orig:.4f}  scrambled={scr:.4f}  "
+              f"{'✓ identical' if abs(orig - scr) < 1e-9 else 'differ'}")
+
+    formatted_texts = []
+    for _, row in df_scrambled.iterrows():
+        text = row["free_text"]
+        t = normalize_tnm_label(str(row.get("T_target", "Unknown")), "T")
+        n_lbl = normalize_tnm_label(str(row.get("N_target", "Unknown")), "N")
+        m = normalize_tnm_label(str(row.get("M_target", "Unknown")), "M")
+        prompt = (
+            "You are a clinical data extractor. Read the clinical note and extract the TNM staging. "
+            "Return a strictly formatted JSON object with keys 'T', 'N', and 'M'. "
+            "Always use the full prefixed format: e.g. 'T2', 'N1', 'M0'. "
+            "If a value is not found, use 'Unknown'.\n\n"
+            f"NOTE: {text}"
+        )
+        completion = json.dumps({"T": t, "N": n_lbl, "M": m})
+        full_text = (
+            f"<|begin_of_text|><|start_header_id|>user<|end_header_id|>\n\n"
+            f"{prompt}<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n"
+            f"{completion}<|eot_id|>"
+        )
+        formatted_texts.append(full_text)
+
+    dataset = Dataset.from_dict({"text": formatted_texts})
+
+    def tokenize_fn(examples):
+        return tokenizer(examples["text"], truncation=True, max_length=1024)
+
+    return dataset.map(tokenize_fn, batched=True, remove_columns=["text"])
 
 def normalize_tnm_label(value: str, prefix: str) -> str:
     v = str(value).strip().upper()
@@ -70,7 +138,7 @@ def check_label_diversity(df: pd.DataFrame, csv_path: str, abort_on_fail: bool =
         counts  = labels.value_counts()
         ent     = shannon_entropy(counts) if len(counts) > 1 else 0.0
         floor   = DIVERSITY_ENTROPY_FLOOR[key]
-        status  = "✓ PASS" if ent >= floor else "✗ FAIL ⚠️"
+        status  = "PASS" if ent >= floor else "FAIL "
         if ent < floor: all_pass = False
         print(f"  [{col}] entropy={ent:.3f}  floor={floor:.3f}  {status}")
         print(f"           distribution: {counts.to_dict()}")
@@ -208,7 +276,15 @@ def main():
     # Adapter A — Tier 1 Raw (UNKNOWN labels by design; diversity check is informational only)
     dataset_tier1 = prepare_dataset(tier1_csv, tokenizer)
     if dataset_tier1:
-        train_qlora_adapter(dataset_tier1, "adapters/tier1_raw",    "Tier 1 (Raw)",    tokenizer)
+        train_qlora_adapter(dataset_tier1, "adapters/tier1_raw", "Adapter A — Tier 1 (Raw)", tokenizer)
+
+    # Adapter A' — Tier 3 Golden, label triples permuted (seed-42 derangement).
+    # Same records/entropy as Adapter B; only note-to-label correspondence destroyed.
+    os.makedirs("adapters/tier3_scrambled", exist_ok=True)
+    dataset_scrambled = prepare_scrambled_dataset(tier3_csv, tokenizer, seed=42)
+    if dataset_scrambled:
+        train_qlora_adapter(dataset_scrambled, "adapters/tier3_scrambled",
+                            "Adapter A' — Tier 3 (Scrambled)", tokenizer)
 
     # Adapter B — Tier 3 Golden (must pass diversity gate before training proceeds)
     import pandas as _pd
@@ -216,9 +292,12 @@ def main():
     check_label_diversity(_df3, tier3_csv, abort_on_fail=True)
     dataset_tier3 = prepare_dataset(tier3_csv, tokenizer)
     if dataset_tier3:
-        train_qlora_adapter(dataset_tier3, "adapters/tier3_golden", "Tier 3 (Golden)", tokenizer)
+        train_qlora_adapter(dataset_tier3, "adapters/tier3_golden", "Adapter B — Tier 3 (Golden)", tokenizer)
 
-    print("\nAll adapters trained.")
+    print("\nAll three adapters trained.")
+    print("  adapters/tier1_raw/final_adapter       — Adapter A")
+    print("  adapters/tier3_scrambled/final_adapter — Adapter A'")
+    print("  adapters/tier3_golden/final_adapter    — Adapter B")
     print("Next: run pipeline/phase3_benchmark.py to benchmark.")
 
 
